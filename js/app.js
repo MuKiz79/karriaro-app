@@ -7448,7 +7448,7 @@ function displayWaitlist(entries) {
                     <div class="flex items-center gap-4 text-sm text-gray-500">
                         <span><i class="fas fa-briefcase mr-1"></i>${sanitizeHTML(entry.currentRole || '--')}</span>
                         <span><i class="fas fa-building mr-1"></i>${sanitizeHTML(entry.company || '--')}</span>
-                        <span><i class="fas fa-clock mr-1"></i>${entry.yearsExperience || '--'} Jahre</span>
+                        <span><i class="fas fa-clock mr-1"></i>${sanitizeHTML(entry.yearsExperience || '--')} Jahre</span>
                         <span class="ml-auto text-xs">${dateStr}</span>
                     </div>
                 </div>
@@ -7492,8 +7492,11 @@ export function openWaitlistDetail(entryId) {
     document.getElementById('waitlist-detail-notes').value = entry.notes || '';
 
     const linkedinLink = document.getElementById('waitlist-detail-linkedin');
-    if (entry.linkedin) {
-        linkedinLink.href = entry.linkedin;
+    // 2026-06-09 (M5): linkedin-URL vor href-Zuweisung auf http(s) validieren —
+    // sonst koennte ein `javascript:`-URI beim Admin-Klick Code ausfuehren.
+    const safeLinkedin = /^https?:\/\//i.test(entry.linkedin || '') ? entry.linkedin : '';
+    if (safeLinkedin) {
+        linkedinLink.href = safeLinkedin;
         linkedinLink.textContent = 'Profil öffnen';
     } else {
         linkedinLink.href = '#';

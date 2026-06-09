@@ -108,6 +108,18 @@ function getClientIp(req) {
     return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
 }
 
+// 2026-06-09 Security-Audit (M4): HTML-Entity-Escape fuer User-Input, der in
+// Mail-HTML-Bodies interpoliert wird (verhindert HTML-/Phishing-Injection +
+// Attribut-Breakout in href). OWASP-Set.
+function escapeHtml(input) {
+    return String(input == null ? '' : input)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 // ========== PRODUKTKATALOG - Single Source of Truth für Preise ==========
 const PRODUCT_CATALOG = {
     // CV Pakete
@@ -6050,7 +6062,22 @@ exports.onNewConciergeRequest = onDocumentCreated({
         return;
     }
 
+    // 2026-06-09 (H3): globales Rate-Limit gegen Mailbombing / Denial-of-Wallet.
+    // Die Create-Rule erlaubt (bewusst) anonyme Anfragen; ohne diese Drossel
+    // triggert JEDER Write genau eine Admin-SMTP-Mail. Max 20 Concierge-Mails/Std
+    // insgesamt (rateLimits-Collection via Admin-SDK). fail-open bei Fehler.
+    const conciergeRl = await checkRateLimit('global', 'concierge-mail', 20, 60 * 60 * 1000);
+    if (!conciergeRl.allowed) {
+        console.warn('⛔ Concierge-Mail rate-limited (20/h erreicht) — Benachrichtigung übersprungen');
+        return;
+    }
+
     const { name, email, message, createdAt } = data;
+    // 2026-06-09 (M4): User-Input vor HTML-Interpolation escapen (Phishing-/
+    // Attribut-Breakout-Schutz im Admin-Postfach).
+    const safeName = escapeHtml(name);
+    const safeEmail = escapeHtml(email);
+    const safeMessage = escapeHtml(message);
     const adminEmail = 'muammer.kizilaslan@gmail.com';
 
     console.log('📧 Sending concierge request notification to admin...');
@@ -6071,7 +6098,7 @@ exports.onNewConciergeRequest = onDocumentCreated({
         await transporter.sendMail({
             from: `"Karriaro" <${smtpUser.value()}>`,
             to: adminEmail,
-            subject: `🔔 Neue Anfrage von ${name}`,
+            subject: `🔔 Neue Anfrage von ${safeName}`,
             html: `
                 <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 0 auto; background: #0B1120; padding: 40px; border-radius: 16px;">
                     <div style="text-align: center; margin-bottom: 30px;">
@@ -6083,12 +6110,12 @@ exports.onNewConciergeRequest = onDocumentCreated({
                         <table style="width: 100%; border-collapse: collapse;">
                             <tr>
                                 <td style="color: #9ca3af; padding: 8px 0; width: 100px;">Name:</td>
-                                <td style="color: #ffffff; padding: 8px 0; font-weight: bold;">${name}</td>
+                                <td style="color: #ffffff; padding: 8px 0; font-weight: bold;">${safeName}</td>
                             </tr>
                             <tr>
                                 <td style="color: #9ca3af; padding: 8px 0;">E-Mail:</td>
                                 <td style="color: #c9a87c; padding: 8px 0;">
-                                    <a href="mailto:${email}" style="color: #c9a87c; text-decoration: none;">${email}</a>
+                                    <a href="mailto:${safeEmail}" style="color: #c9a87c; text-decoration: none;">${safeEmail}</a>
                                 </td>
                             </tr>
                             <tr>
@@ -6100,11 +6127,11 @@ exports.onNewConciergeRequest = onDocumentCreated({
 
                     <div style="background: rgba(201, 168, 124, 0.1); border: 1px solid rgba(201, 168, 124, 0.3); border-radius: 12px; padding: 24px;">
                         <p style="color: #c9a87c; margin: 0 0 10px; font-weight: bold; font-size: 14px;">Nachricht:</p>
-                        <p style="color: #ffffff; margin: 0; line-height: 1.6; white-space: pre-wrap;">${message}</p>
+                        <p style="color: #ffffff; margin: 0; line-height: 1.6; white-space: pre-wrap;">${safeMessage}</p>
                     </div>
 
                     <div style="margin-top: 30px; text-align: center;">
-                        <a href="mailto:${email}?subject=Re: Ihre Anfrage bei Karriaro"
+                        <a href="mailto:${safeEmail}?subject=Re: Ihre Anfrage bei Karriaro"
                            style="display: inline-block; background: #c9a87c; color: #0B1120; padding: 14px 32px; border-radius: 50px; text-decoration: none; font-weight: bold; font-size: 14px;">
                             Direkt antworten
                         </a>

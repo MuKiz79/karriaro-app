@@ -16,6 +16,13 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.admin == true;
     }
 
+    // 2026-06-09 Security-Audit: E-Mail-basiertes Scoping (customerEmail) NUR mit
+    // verifizierter E-Mail erlauben — sonst registriert ein Angreifer mit dem
+    // oeffentlichen Web-Key die E-Mail eines Opfers und liest dessen Daten (H2/M2).
+    function emailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
     // ========== USER DATA ==========
 
     // Users Collection - Users können nur ihr eigenes Profil lesen/schreiben
@@ -26,6 +33,10 @@ service cloud.firestore {
       allow update: if isOwner(userId) || isAdmin();
       allow delete: if false;
       // Hinweis: Admin-Leseberechtigung erlaubt auch Collection-Queries
+      // L3 (2026-06-09, latent): keine Feld-Whitelist auf Eigen-Update. Heute
+      // unkritisch, da KEIN users-Feld zur Autorisierung gelesen wird (Admin =
+      // Token-Claim). Falls je ein Entitlement-/Rollen-/Credit-Feld eingefuehrt
+      // wird: NICHT ins users-Doc, sondern Token-Claim/admin-only-Doc.
     }
 
     // ========== ORDERS ==========
@@ -34,9 +45,13 @@ service cloud.firestore {
     match /orders/{orderId} {
       // Lesen (get + list): User kann eigene Orders lesen, Mentor kann zugewiesene lesen, Admin kann alle lesen
       // WICHTIG: Bei list-Queries prüft Firestore ob ALLE zurückgegebenen Dokumente die Regel erfüllen
+      // 2026-06-09 (H2): customerEmail-Branch verlangt jetzt VERIFIZIERTE E-Mail.
+      // Sonst registriert ein Angreifer mit dem oeffentlichen Web-Key die E-Mail
+      // eines Opfers und liest dessen Bestellungen (Klarname, CV-/Fragebogendaten
+      // = DSGVO, Termine). Account-gebundene Orders (userId) sind unberuehrt.
       allow read: if isSignedIn() && (
         resource.data.userId == request.auth.uid ||
-        resource.data.customerEmail == request.auth.token.email ||
+        (resource.data.customerEmail == request.auth.token.email && emailVerified()) ||
         resource.data.assignedCoachId == request.auth.uid ||
         isAdmin()
       );
@@ -94,21 +109,33 @@ service cloud.firestore {
 
     // Settings - Öffentlich lesbar, Admin kann ändern
     match /settings/{document} {
-      allow read: if true;
+      // 2026-06-09 (M3): settings/vvt (internes DSGVO-Verarbeitungsverzeichnis nach
+      // Art. 30 + Sub-Prozessoren/Loeschfristen) war anonym lesbar → nur noch Admin.
+      // Uebrige settings-Docs (about/mentoring/portfolio/templateStatus/legal) bleiben
+      // oeffentlich (Website-Content). Hinweis (L9): besser kuenftig per-Doc-Allowlist
+      // ODER sensible Docs in eine eigene admin-only-Collection statt settings.
+      allow read: if isAdmin() || document != 'vvt';
       allow write: if isAdmin();
     }
 
     // Strategy Calls - Erstellen nur mit validen Daten, Admin kann lesen/ändern
     match /strategyCalls/{callId} {
-      // Rate-Limiting: Max 5 Einträge pro Stunde pro IP (wird in Cloud Function geprüft)
-      // Basis-Validierung: Name und Email müssen vorhanden sein
+      // 2026-06-09 (H3/M4): geschlossenes Feld-Set (keine status/reviewedBy-Injection),
+      // E-Mail-Grobformat, message-Groessen-Cap. Die anonyme Create bleibt (Concierge-
+      // Formular ist oeffentlich) — das Mailbombing wird im onNewConciergeRequest-Trigger
+      // server-seitig per Rate-Limit gedrosselt. (Frueher behauptete der Kommentar ein
+      // Rule-/Trigger-Rate-Limit, das es nicht gab — I1.)
       allow create: if request.resource.data.keys().hasAll(['name', 'email'])
+                    && request.resource.data.keys().hasOnly(['name', 'email', 'message', 'source', 'createdAt'])
                     && request.resource.data.name is string
                     && request.resource.data.name.size() > 0
                     && request.resource.data.name.size() < 100
                     && request.resource.data.email is string
                     && request.resource.data.email.size() > 5
-                    && request.resource.data.email.size() < 100;
+                    && request.resource.data.email.size() < 100
+                    && request.resource.data.email.matches('^[^@]+@[^@]+[.][^@]+$')
+                    && request.resource.data.message is string
+                    && request.resource.data.message.size() < 5000;
       allow read: if isAdmin();
       allow update: if isAdmin();
       allow delete: if false;
@@ -116,12 +143,26 @@ service cloud.firestore {
 
     // Waitlist - Erstellen nur mit valider Email
     match /waitlist/{entryId} {
+      // 2026-06-09 (M5): geschlossenes Feld-Set + erzwungenes status=='pending'
+      // (verhindert Self-Approval/Reviewer-Faelschung beim Create) + Groessen-Caps.
+      // Reine Validierung — das Formular sendet exakt diese Felder.
       allow create: if request.resource.data.keys().hasAll(['email'])
+                    && request.resource.data.keys().hasOnly([
+                      'name', 'email', 'linkedin', 'currentRole', 'company',
+                      'yearsExperience', 'reason', 'status', 'submittedAt',
+                      'reviewedBy', 'reviewedAt', 'notes', 'interviewDate', 'interviewNotes'
+                    ])
                     && request.resource.data.email is string
                     && request.resource.data.email.size() > 5
-                    && request.resource.data.email.size() < 100;
+                    && request.resource.data.email.size() < 100
+                    && request.resource.data.email.matches('^[^@]+@[^@]+[.][^@]+$')
+                    && request.resource.data.status == 'pending';
       allow read: if isAdmin();
-      allow update, delete: if false;
+      // 2026-06-09 (L8): Admin-Approval-Flow war durch `if false` blockiert →
+      // Admin darf jetzt aktualisieren (Status/Notizen/Interview). Reine Funktions-
+      // Reparatur, Lese-/Schreibzugriff bleibt admin-only.
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
     }
 
     // Admin Config - Nur Admin kann lesen/schreiben
@@ -143,19 +184,21 @@ service cloud.firestore {
     // CV Projects Collection - Admin kann alles, Kunden können eigene lesen/schreiben (Fragebogen)
     match /cvProjects/{projectId} {
       // Lesen: Admin kann alle lesen, User kann eigene lesen (per userId ODER customerEmail)
+      // 2026-06-09 (M2): customerEmail-Branch verlangt jetzt VERIFIZIERTE E-Mail
+      // (Lesen UND Aendern fremder CV-Daten verhindern; gleiche Mechanik wie H2).
       allow read: if isAdmin() || (
         isSignedIn() && (
           resource.data.userId == request.auth.uid ||
-          resource.data.customerEmail == request.auth.token.email
+          (resource.data.customerEmail == request.auth.token.email && emailVerified())
         )
       );
       // Erstellen: Nur Admin oder System (Cloud Function)
       allow create: if isAdmin();
       // Update: Admin kann alles, User kann nur Fragebogen-bezogene Felder ändern
-      // User wird identifiziert per userId ODER customerEmail
+      // User wird identifiziert per userId ODER (verifizierter) customerEmail
       allow update: if isAdmin() || (
         isSignedIn() &&
-        (resource.data.userId == request.auth.uid || resource.data.customerEmail == request.auth.token.email) &&
+        (resource.data.userId == request.auth.uid || (resource.data.customerEmail == request.auth.token.email && emailVerified())) &&
         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['questionnaire', 'documents', 'updatedAt', 'status', 'mode', 'submittedAt', 'templateSelection'])
       );
       allow delete: if isAdmin();
@@ -188,6 +231,17 @@ service cloud.firestore {
 
     match /leadSettings/{userId} {
       allow read, write: if isOwner(userId);
+    }
+
+    // ========== INNER CIRCLE MEMBERS ==========
+    // 2026-06-09 (L7): Hatte keine Rule → Catch-all-deny → Admin-Inner-Circle-CRUD
+    // + Waitlist→Member-Approval warfen permission-denied (Feature still gebrochen).
+    // Jetzt admin-only (CRUD). Read bewusst NICHT isSignedIn (kein Over-Expose der
+    // Mitglieder-Daten); der Per-Login-Scan checkAndSetupInnerCircleMember scheitert
+    // fuer Nicht-Admins weiterhin still (try/catch) — kein Login-Bruch, kein Leak.
+    match /members/{memberId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if isAdmin();
     }
 
     // ========== CATCH-ALL: DENY ==========

@@ -233,6 +233,17 @@ service cloud.firestore {
       allow read, write: if isOwner(userId);
     }
 
+    // 2026-07-26: Outcome-Historie des Lead-Werkzeugs (gewonnen/verloren je Lead).
+    // Lag bisher NUR in localStorage — ein geleerter Cache oder ein zweites Geraet
+    // loeschte damit die gesamte Lernhistorie, waehrend die Leads selbst laengst
+    // gesynct wurden. Ohne diese Regel greift der Catch-all-Deny unten und die
+    // Spiegelung stirbt STILL (der Client faengt den Fehler ab) — exakt der Fall,
+    // der oben bei /members schon einmal dokumentiert ist.
+    // Ein Dokument je Nutzer, ausschliesslich fuer den Eigentuemer.
+    match /leadFeedback/{userId} {
+      allow read, write: if isOwner(userId);
+    }
+
     // ========== INNER CIRCLE MEMBERS ==========
     // 2026-06-09 (L7): Hatte keine Rule → Catch-all-deny → Admin-Inner-Circle-CRUD
     // + Waitlist→Member-Approval warfen permission-denied (Feature still gebrochen).

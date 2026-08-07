@@ -6934,11 +6934,33 @@ exports.enrichContact = onRequest(async (req, res) => {
         } catch (e) { /* no impressum page */ }
 
         const combined = html + ' ' + impressumHtml;
+
+        // ⚠️ mailto:/tel: VOR dem Tag-Strip einsammeln.
+        // Der Strip unten ersetzt jedes <…> durch ein Leerzeichen und loescht damit
+        // auch <a href="mailto:kanzlei@example.de">Schreiben Sie uns</a> samt Adresse.
+        // Sehr viele KMU-Seiten hinterlegen ihre Adresse AUSSCHLIESSLICH als Link
+        // (Spam-Schutz) — die galten dadurch als "kein Kontakt" und fielen im
+        // Outreach-Studio durch das Erreichbarkeits-Gate, obwohl die Adresse
+        // im Quelltext stand.
+        const linkedEmails = [];
+        for (const m of combined.matchAll(/href\s*=\s*["']mailto:([^"'?>]+)/gi)) {
+            const addr = String(m[1] || '').trim();
+            if (addr.includes('@') && !/\s/.test(addr)) linkedEmails.push(addr);
+        }
+        const linkedPhones = [];
+        for (const m of combined.matchAll(/href\s*=\s*["']tel:([^"'>]+)/gi)) {
+            const num = String(m[1] || '').trim();
+            if (num) linkedPhones.push(num);
+        }
+
         // Entferne HTML-Tags für Pattern-Matching
-        const text = combined.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+        const strippedText = combined.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
             .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
             .replace(/<[^>]+>/g, ' ')
             .replace(/\s+/g, ' ');
+        // Die verlinkten Adressen wieder anhaengen, damit die bestehenden Regex
+        // unveraendert weiterlaufen koennen.
+        const text = strippedText + ' ' + linkedEmails.join(' ') + ' ' + linkedPhones.join(' ');
 
         const result = {
             emails: [],

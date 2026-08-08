@@ -244,6 +244,19 @@ service cloud.firestore {
       allow read, write: if isOwner(userId);
     }
 
+    // 2026-08-08: Lead-Bewertungen des Founders („würde ich anrufen?") samt
+    // eingefrorenem Merkmalsvektor — die Trainingsdaten der gelernten Rangfolge.
+    // Doc-ID `${uid}_${domain}` wie bei /leads und /suppression, Zugriff über das
+    // uid-Feld (nicht über die ID, die ist nur ein Schlüssel).
+    // Ohne diese Regel greift der Catch-all-Deny unten und der Sync stirbt STILL —
+    // derselbe Fall wie oben bei /members und zuletzt bei /leadFeedback.
+    match /leadRatings/{ratingId} {
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
     // ========== INNER CIRCLE MEMBERS ==========
     // 2026-06-09 (L7): Hatte keine Rule → Catch-all-deny → Admin-Inner-Circle-CRUD
     // + Waitlist→Member-Approval warfen permission-denied (Feature still gebrochen).

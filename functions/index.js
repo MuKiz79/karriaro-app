@@ -6453,6 +6453,25 @@ exports.nearbyPlaces = onRequest({ secrets: [placesApiKey] }, async (req, res) =
 
 // ========== LEAD INTELLIGENCE: ADVANCED CLOUD FUNCTIONS ==========
 
+// 2026-08-15 — Modell-Antworten robust nach JSON parsen. Neuere Modelle legen
+// trotz „Antworte NUR als JSON" ```json-Zäune um die Antwort; das nackte
+// JSON.parse warf dann 500 und die Vision-Stufe des Scanners war MONATE still
+// tot (der Client fängt den Fehler und macht ohne Verdikt weiter — gefunden
+// erst durch die Rangfolge-Verifikation vom 15.08.). Zäune strippen, zur Not
+// das erste {...}-Segment greifen.
+function parseClaudeJson(text) {
+    const raw = String(text || '').trim()
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```\s*$/, '');
+    if (!raw) return {};
+    try { return JSON.parse(raw); }
+    catch {
+        const m = raw.match(/\{[\s\S]*\}/);
+        if (m) { try { return JSON.parse(m[0]); } catch { /* faellt durch */ } }
+        throw new Error('Modell-Antwort ist kein JSON');
+    }
+}
+
 // A1: LLM Content-Analyse — Fetcht HTML und analysiert mit Claude
 exports.analyzeContent = onRequest({ secrets: [claudeApiKey] }, async (req, res) => {
     if (leadCors(req, res)) return;
@@ -6476,7 +6495,7 @@ exports.analyzeContent = onRequest({ secrets: [claudeApiKey] }, async (req, res)
             })
         });
         const claude = await claudeRes.json();
-        const analysis = JSON.parse(claude.content?.[0]?.text || '{}');
+        const analysis = parseClaudeJson(claude.content?.[0]?.text);
         res.json(analysis);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -6500,7 +6519,7 @@ exports.analyzeScreenshot = onRequest({ secrets: [claudeApiKey] }, async (req, r
             })
         });
         const claude = await claudeRes.json();
-        const analysis = JSON.parse(claude.content?.[0]?.text || '{}');
+        const analysis = parseClaudeJson(claude.content?.[0]?.text);
         res.json(analysis);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -6532,7 +6551,7 @@ exports.analyzeReviews = onRequest({ secrets: [claudeApiKey, placesApiKey] }, as
                 messages: [{ role: 'user', content: `Analysiere diese Google-Bewertungen. Antworte NUR als JSON: {"sentiment":"positiv|neutral|negativ","websiteComplaints":0-5,"websiteIssues":["..."],"overallSatisfaction":1-10,"summary":"1 Satz"}\n\nReviews:\n${reviewTexts}` }]
             })
         });
-        const analysis = JSON.parse((await claudeRes.json()).content?.[0]?.text || '{}');
+        const analysis = parseClaudeJson((await claudeRes.json()).content?.[0]?.text);
         res.json(analysis);
     } catch (e) { res.status(500).json({ error: e.message }); }
 });

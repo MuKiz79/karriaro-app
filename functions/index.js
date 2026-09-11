@@ -22,6 +22,17 @@ const smtpPass = defineSecret('SMTP_PASS');
 const dailyApiKey = defineSecret('DAILY_API_KEY');
 const claudeApiKey = defineSecret('CLAUDE_API_KEY');
 
+// 2026-09-10: claude-sonnet-4-20250514 ist abgeschaltet (Anthropic 404) — jede
+// Sonnet-Function dieser Codebase lief damit ins Leere (generateCvContent gab
+// 500, die Lead-Functions still ein leeres Objekt). Gleiche Stufe wie vorher,
+// in der webdesign-Codebase seit Sprint 253 live. Die Aufrufe hier senden nur
+// model/max_tokens/messages (kein Assistant-Prefill, kein budget_tokens) —
+// beides wuerde auf 4.6 mit 400 abgelehnt.
+const SONNET_MODEL = 'claude-sonnet-4-6';
+
+// Reine Impressum-Auswertung (Inhaber, Werbewiderspruch) fuer enrichContact.
+const { erkenneInhaber, erkenneWerbewiderspruch, textMitBloecken } = require('./lib/impressum-inhaber');
+
 // Set global options (Standard für alle Functions)
 setGlobalOptions({
   region: 'us-central1',
@@ -2729,7 +2740,7 @@ Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt (keine Markdown-Codeblöc
                 'content-type': 'application/json'
             },
             body: JSON.stringify({
-                model: 'claude-sonnet-4-20250514',
+                model: SONNET_MODEL,
                 max_tokens: 4096,
                 messages: [{ role: 'user', content: prompt }]
             })
@@ -2782,7 +2793,7 @@ Antworte AUSSCHLIESSLICH mit einem validen JSON-Objekt (keine Markdown-Codeblöc
                 // Generated content
                 data: generatedCvData,
                 generatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                model: 'claude-sonnet-4-20250514'
+                model: SONNET_MODEL
             },
             status: 'ready',
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -6407,24 +6418,86 @@ function leadRateLimit(req, res) {
 }
 
 // Places Text Search — "Friseur Hamburg" oder "beispiel.de"
-exports.searchPlaces = onRequest({ secrets: [placesApiKey] }, async (req, res) => {
+const SEARCH_PLACES_FELDER = 'places.id,places.displayName,places.rating,places.userRatingCount,places.websiteUri,places.formattedAddress,places.primaryTypeDisplayName,places.regularOpeningHours,places.photos,places.businessStatus,places.location,places.primaryType,places.reviews,places.internationalPhoneNumber';
+
+// maxPages: 1–3, alles andere (fehlend, Unsinn) → 1 = bisheriges Verhalten.
+function searchPlacesSeitenzahl(wert) {
+    const n = Number.parseInt(wert, 10);
+    if (!Number.isFinite(n)) return 1;
+    return Math.min(3, Math.max(1, n));
+}
+
+// 2026-09-10: Folgeseiten (nextPageToken) und bald eröffnende Betriebe.
+// Ohne maxPages/includeFutureOpening laeuft exakt die bisherige Anfrage
+// (gleiche Feldmaske, gleicher Body) — die Antwort traegt nur zusaetzlich
+// pagesFetched. Jede Folgeseite ist eine eigene, eigens abgerechnete
+// Places-Anfrage (Text Search mit reviews/phone = teure SKU).
+// Places API (New), laut Discovery-Dokument v1: beim Blaettern muessen alle
+// Parameter ausser pageToken/pageSize/maxResultCount identisch bleiben, sonst
+// INVALID_ARGUMENT; openingDate ist nur bei businessStatus FUTURE_OPENING belegt.
+async function searchPlacesHandler(req, res) {
     if (leadCors(req, res)) return;
     if (leadRateLimit(req, res)) return;
-    const { query, maxResults = 10 } = req.body || {};
+    const { query, maxResults = 10, maxPages, includeFutureOpening } = req.body || {};
     if (!query) return res.status(400).json({ error: 'query required' });
-    try {
+    const seiten = searchPlacesSeitenzahl(maxPages);
+    const mitEroeffnung = includeFutureOpening === true;
+    const feldmaske = SEARCH_PLACES_FELDER
+        + (mitEroeffnung ? ',places.openingDate' : '')
+        + (seiten > 1 ? ',nextPageToken' : '');
+    const grundBody = { textQuery: query, languageCode: 'de', maxResultCount: Math.min(maxResults, 20) };
+    if (mitEroeffnung) grundBody.includeFutureOpeningBusinesses = true;
+
+    const holeSeite = async (pageToken) => {
         const r = await fetch('https://places.googleapis.com/v1/places:searchText', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'X-Goog-Api-Key': placesApiKey.value(),
-                'X-Goog-FieldMask': 'places.displayName,places.rating,places.userRatingCount,places.websiteUri,places.formattedAddress,places.primaryTypeDisplayName,places.regularOpeningHours,places.photos,places.businessStatus,places.location,places.primaryType,places.reviews,places.internationalPhoneNumber'
+                'X-Goog-FieldMask': feldmaske
             },
-            body: JSON.stringify({ textQuery: query, languageCode: 'de', maxResultCount: Math.min(maxResults, 20) })
+            body: JSON.stringify(pageToken ? { ...grundBody, pageToken } : grundBody)
         });
-        res.json(await r.json());
+        const data = await r.json();
+        return { ok: r.ok && !(data && data.error), status: r.status, data: data || {} };
+    };
+
+    try {
+        const erste = await holeSeite(null);
+        if (seiten === 1 || !erste.ok) {
+            return res.json({ ...erste.data, pagesFetched: erste.ok ? 1 : 0 });
+        }
+        const places = Array.isArray(erste.data.places) ? [...erste.data.places] : [];
+        let token = erste.data.nextPageToken || null;
+        let pagesFetched = 1;
+        let pageError = null;
+        while (token && pagesFetched < seiten) {
+            // Pruefer 2026-09-10: ein Netz-/JSON-Fehler auf einer FOLGESEITE warf
+            // bisher in den 500-Pfad und verwarf die schon bezahlte erste Seite.
+            let naechste;
+            try {
+                naechste = await holeSeite(token);
+            } catch (e) {
+                pageError = e.message || 'Folgeseite nicht lesbar';
+                console.warn('searchPlaces: Folgeseite fehlgeschlagen', { query, pagesFetched, pageError });
+                break;
+            }
+            if (!naechste.ok) {
+                pageError = naechste.data?.error?.status || `HTTP ${naechste.status}`;
+                console.warn('searchPlaces: Folgeseite fehlgeschlagen', { query, pagesFetched, pageError });
+                break;
+            }
+            pagesFetched++;
+            if (Array.isArray(naechste.data.places)) places.push(...naechste.data.places);
+            token = naechste.data.nextPageToken || null;
+        }
+        const antwort = { ...erste.data, places, pagesFetched };
+        delete antwort.nextPageToken; // Token ist nur serverseitig verwendbar
+        if (pageError) antwort.pageError = pageError;
+        res.json(antwort);
     } catch (e) { res.status(500).json({ error: e.message }); }
-});
+}
+exports.searchPlaces = onRequest({ secrets: [placesApiKey] }, searchPlacesHandler);
 
 // Places Nearby Search — Konkurrenten im Umkreis
 exports.nearbyPlaces = onRequest({ secrets: [placesApiKey] }, async (req, res) => {
@@ -6659,8 +6732,15 @@ ${text}`;
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': claudeApiKey.value(), 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1500, messages: [{ role: 'user', content: prompt }] })
+            body: JSON.stringify({ model: SONNET_MODEL, max_tokens: 1500, messages: [{ role: 'user', content: prompt }] })
         });
+        // 2026-09-10: ein Anthropic-Fehler (z. B. 404 fuer ein abgeschaltetes
+        // Modell) hat keinen content — frueher wurde daraus still „{}" mit 200.
+        if (!claudeRes.ok) {
+            const fehlerText = await claudeRes.text().catch(() => '');
+            console.error('analyzeBranchStandards: Anthropic-Fehler', claudeRes.status, fehlerText.slice(0, 300));
+            return res.status(502).json({ error: 'KI-Analyse nicht verfügbar', status: claudeRes.status });
+        }
         const claude = await claudeRes.json();
         const responseText = claude.content?.[0]?.text || '{}';
 
@@ -6914,8 +6994,14 @@ Erstelle einen KONKRETEN Vorschlag als JSON:
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': claudeApiKey.value(), 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: 'claude-sonnet-4-20250514', max_tokens: 1000, messages })
+            body: JSON.stringify({ model: SONNET_MODEL, max_tokens: 1000, messages })
         });
+        // Siehe analyzeBranchStandards: Anthropic-Fehler nicht als leeres Objekt tarnen.
+        if (!claudeRes.ok) {
+            const fehlerText = await claudeRes.text().catch(() => '');
+            console.error('generateMockupSuggestion: Anthropic-Fehler', claudeRes.status, fehlerText.slice(0, 300));
+            return res.status(502).json({ error: 'KI-Vorschlag nicht verfügbar', status: claudeRes.status });
+        }
         const claude = await claudeRes.json();
         const responseText = claude.content?.[0]?.text || '{}';
         const jsonMatch = responseText.match(/\{[\s\S]*\}/);
@@ -6927,7 +7013,31 @@ Erstelle einen KONKRETEN Vorschlag als JSON:
 
 // ========== CONTACT ENRICHMENT ==========
 // Versucht Kontaktdaten aus Impressum/Website zu extrahieren
-exports.enrichContact = onRequest(async (req, res) => {
+// Verlinkte Impressum-Seite derselben Origin (…/impressum.html, /de/impressum/,
+// /imprint). Fremde Hosts werden nie angefragt.
+// Pruefer 2026-09-10: derselbe Host gilt mit und ohne „www." und ueber http wie
+// https. Places liefert oft „http://beispiel.de/", die Seite verlinkt aber
+// absolut auf „https://www.beispiel.de/impressum/" (WordPress) — ein strenger
+// Origin-Vergleich verwarf genau diesen haeufigsten Fall. Ein Sprungziel
+// („impressum.html#top") zaehlt mit; ein reiner Anker („#impressum") nicht,
+// der Inhalt steht dann ohnehin schon auf der Startseite.
+function hostOhneWww(u) {
+    try { return new URL(u).hostname.toLowerCase().replace(/^www\./, ''); } catch { return null; }
+}
+
+function impressumLinkAus(html, basisUrl, ...weitereUrls) {
+    const erlaubt = new Set([basisUrl, ...weitereUrls].map(hostOhneWww).filter(Boolean));
+    if (!erlaubt.size) return null;
+    for (const m of String(html || '').matchAll(/href\s*=\s*["']([^"'#>]*(?:impressum|imprint)[^"'#>]*)(?:#[^"'>]*)?["']/gi)) {
+        try {
+            const ziel = new URL(m[1], basisUrl);
+            if (/^https?:$/.test(ziel.protocol) && erlaubt.has(hostOhneWww(ziel.href))) return ziel.href;
+        } catch { /* ungueltiger Link, naechster */ }
+    }
+    return null;
+}
+
+async function enrichContactHandler(req, res) {
     if (leadCors(req, res)) return;
     if (leadRateLimit(req, res)) return;
     const { url } = req.body || {};
@@ -6941,16 +7051,38 @@ exports.enrichContact = onRequest(async (req, res) => {
         });
         let html = await htmlRes.text();
 
-        // Versuche auch /impressum zu laden
+        // Impressum laden: zuerst die auf der Startseite verlinkte Seite, dann
+        // /impressum. 2026-09-10: nur /impressum zu raten verfehlte jede Seite
+        // mit /impressum.html oder Sprachpfad — Inhaber und Werbewiderspruch
+        // standen dann nie im Text, und „kein Widerspruch gefunden" hiess in
+        // Wahrheit „nicht geprueft" (siehe impressumGeladen).
         let impressumHtml = '';
-        try {
-            const domain = new URL(url).origin;
-            const impRes = await fetch(domain + '/impressum', {
-                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Karriaro-Bot/1.0)' },
-                signal: AbortSignal.timeout(5000)
-            });
-            if (impRes.ok) impressumHtml = await impRes.text();
-        } catch (e) { /* no impressum page */ }
+        // Relative Links gegen die ENDGUELTIGE Adresse aufloesen (nach Weiterleitung).
+        const basisUrl = (typeof htmlRes.url === 'string' && htmlRes.url) ? htmlRes.url : url;
+        const kandidaten = [];
+        const verlinkt = impressumLinkAus(html, basisUrl, url);
+        if (verlinkt) kandidaten.push(verlinkt);
+        for (const u of [basisUrl, url]) {
+            try { kandidaten.push(new URL(u).origin + '/impressum'); } catch { /* url ungueltig */ }
+        }
+        for (const kandidat of [...new Set(kandidaten)]) {
+            try {
+                const impRes = await fetch(kandidat, {
+                    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Karriaro-Bot/1.0)' },
+                    signal: AbortSignal.timeout(5000)
+                });
+                if (!impRes.ok) continue;
+                const seite = await impRes.text();
+                // Pruefer 2026-09-10: Single-Page-Seiten beantworten /impressum mit
+                // der Startseite (200). Das ist kein gelesenes Impressum — sonst
+                // meldete impressumGeladen „geprueft", obwohl nichts geprueft wurde.
+                if (!seite || seite === html) continue;
+                impressumHtml = seite;
+                break;
+            } catch (e) {
+                console.warn('enrichContact: Impressum nicht ladbar', { kandidat, fehler: e.message });
+            }
+        }
 
         const combined = html + ' ' + impressumHtml;
 
@@ -7015,15 +7147,24 @@ exports.enrichContact = onRequest(async (req, res) => {
             })
             .slice(0, 3);
 
-        // Inhabername aus Impressum-Pattern
-        const namePatterns = [
-            /(?:Inhaber|Geschäftsführer|Geschäftsführerin|Verantwortlich|Betreiber)[:\s]+([A-ZÄÖÜ][a-zäöüß]+\s+[A-ZÄÖÜ][a-zäöüß]+)/,
-            /(?:Vertretungsberechtig|Angaben gemäß)[^:]*:\s*([A-ZÄÖÜ][a-zäöüß]+\s+[A-ZÄÖÜ][a-zäöüß]+)/
-        ];
-        for (const pat of namePatterns) {
-            const m = text.match(pat);
-            if (m) { result.owner = m[1].trim(); break; }
-        }
+        // Inhabername: nur rollengebunden und nur, wenn sicher eine Person
+        // (lib/impressum-inhaber.js). Pruefer 2026-09-10: ZUERST das Impressum,
+        // erst danach die Startseite — deren Fliesstext kam im zusammengefuegten
+        // Text vorher dran („Als Betreiber Ihrer …") und konnte den echten
+        // Inhaber verdraengen. Text mit Blockgrenzen, damit ein Zeilenumbruch
+        // den Namen beendet („Klaus Bauer<br>Stuttgart").
+        let inhaber = impressumHtml ? erkenneInhaber(textMitBloecken(impressumHtml)) : { name: null };
+        if (!inhaber.name) inhaber = erkenneInhaber(textMitBloecken(html));
+        result.owner = inhaber.name;
+        result.ownerRole = inhaber.name ? inhaber.rolle : null;
+        result.ownerAnrede = inhaber.name ? inhaber.anrede : null;
+        result.ownerTitel = inhaber.name ? inhaber.titel : null;
+
+        // Werbewiderspruch im Impressum (§ 7 Abs. 1 S. 2 UWG) → Sperrliste im Client.
+        // impressumGeladen trennt „kein Widerspruch gefunden" von „Impressum
+        // gar nicht gelesen" (die Startseite allein traegt die Formel selten).
+        result.werbewiderspruch = erkenneWerbewiderspruch(strippedText);
+        result.impressumGeladen = impressumHtml.length > 0;
 
         // Social Media Links aus HTML
         const igMatch = combined.match(/href=["'](https?:\/\/(?:www\.)?instagram\.com\/[a-zA-Z0-9._]+)\/?["']/i);
@@ -7047,7 +7188,8 @@ exports.enrichContact = onRequest(async (req, res) => {
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
-});
+}
+exports.enrichContact = onRequest(enrichContactHandler);
 
 // ========== PERSONALIZED LEAD PAGE (#7) ==========
 // Generiert eine personalisierte Analyse-Seite für einen Lead
@@ -7185,6 +7327,11 @@ if (process.env.NODE_ENV === 'test') {
         validateAndCorrectPrices,
         checkRateLimit,
         getClientIp,
-        SUPERADMIN_EMAILS
+        SUPERADMIN_EMAILS,
+        SONNET_MODEL,
+        searchPlacesHandler,
+        searchPlacesSeitenzahl,
+        enrichContactHandler,
+        impressumLinkAus
     };
 }

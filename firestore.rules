@@ -257,6 +257,54 @@ service cloud.firestore {
       allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
     }
 
+    // 2026-09-10: Sperrliste des Lead-Werkzeugs („gleicher Lead nie zweimal",
+    // Werbewiderspruch, Abmeldung) aus crm/suppression.js. Lag ohne Regel nur
+    // im localStorage — der Catch-all-Deny liess den Firestore-Sync STILL
+    // scheitern (der Client faengt den Fehler ab), derselbe Fall wie oben.
+    // Doc-ID `${uid}_${domain}` (Domain-Sonderzeichen → '_'), Zugriff ueber das
+    // uid-Feld wie bei /leads und /leadRatings. Zusaetzlich: beim Anlegen muss
+    // die ID mit der EIGENEN uid beginnen, und ein Update darf die uid nicht
+    // wechseln — sonst koennte ein fremdes Konto das Dokument unter der ID des
+    // Eigentuemers vorbelegen und dessen Eintrag (setDoc merge) dauerhaft blockieren.
+    match /suppression/{docId} {
+      allow read: if isSignedIn() && resource.data.uid == request.auth.uid;
+      allow create: if isSignedIn()
+                    && request.resource.data.uid == request.auth.uid
+                    && docId.matches(request.auth.uid + '_[A-Za-z0-9_]+');
+      allow update: if isSignedIn()
+                    && resource.data.uid == request.auth.uid
+                    && request.resource.data.uid == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.uid == request.auth.uid;
+    }
+
+    // 2026-09-10: Werbe-Einwilligungen (Double-Opt-In). Schreiben ausschliesslich
+    // die webdesign-Functions per Admin SDK (einwilligungAnfordern/-Bestaetigen,
+    // abmelden, einwilligungSequenz) — Admin SDK umgeht diese Regeln. Der Client
+    // (Lead-Werkzeug, crm/consents.js) darf lesen und eine Nachfass-Strecke
+    // stoppen, sonst nichts: Wortlaut, Zeitpunkte, Token und Widerruf sind der
+    // Nachweis und duerfen vom Client nie veraendert, angelegt oder geloescht werden.
+    match /consents/{consentId} {
+      allow read: if isAdmin();
+      allow update: if isAdmin()
+                    && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['stopped'])
+                    && request.resource.data.stopped is bool;
+      allow create, delete: if false;
+    }
+
+    // 2026-09-10: Anfragen ueber „Website prüfen" (requestAudit schreibt per
+    // Admin SDK) samt Besuchen der Auswertungsseite. Das Lead-Werkzeug liest sie
+    // live (learning/inbound-signals.js) — ohne Regel scheiterte die
+    // Subscription am Catch-all-Deny. Kein Client schreibt hier.
+    match /auditRequests/{requestId} {
+      allow read: if isAdmin();
+      allow write: if false;
+
+      match /visits/{visitId} {
+        allow read: if isAdmin();
+        allow write: if false;
+      }
+    }
+
     // ========== INNER CIRCLE MEMBERS ==========
     // 2026-06-09 (L7): Hatte keine Rule → Catch-all-deny → Admin-Inner-Circle-CRUD
     // + Waitlist→Member-Approval warfen permission-denied (Feature still gebrochen).

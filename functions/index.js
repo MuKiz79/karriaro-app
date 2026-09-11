@@ -6732,7 +6732,7 @@ ${text}`;
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': claudeApiKey.value(), 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: SONNET_MODEL, max_tokens: 1500, messages: [{ role: 'user', content: prompt }] })
+            body: JSON.stringify({ model: SONNET_MODEL, max_tokens: 3000, messages: [{ role: 'user', content: prompt }] })
         });
         // 2026-09-10: ein Anthropic-Fehler (z. B. 404 fuer ein abgeschaltetes
         // Modell) hat keinen content — frueher wurde daraus still „{}" mit 200.
@@ -6742,11 +6742,20 @@ ${text}`;
             return res.status(502).json({ error: 'KI-Analyse nicht verfügbar', status: claudeRes.status });
         }
         const claude = await claudeRes.json();
-        const responseText = claude.content?.[0]?.text || '{}';
-
-        // Versuche JSON zu extrahieren (Claude gibt manchmal Markdown-Wrapper)
-        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-        const analysis = jsonMatch ? JSON.parse(jsonMatch[0]) : { error: 'Kein JSON in Antwort' };
+        // 2026-09-11: Live-Probe nach dem Wechsel auf Sonnet 4.6 — die Antwort (8–12
+        // Features mit Begründung) lief in max_tokens 1500, brach mitten im Array ab,
+        // und JSON.parse warf 500. Deckel angehoben; eine Kappung ist ein eigener Fehler.
+        if (claude.stop_reason === 'max_tokens') {
+            console.error('analyzeBranchStandards: Antwort am Token-Deckel abgeschnitten', claude.usage);
+            return res.status(502).json({ error: 'KI-Analyse unvollständig (Antwort abgeschnitten)' });
+        }
+        let analysis;
+        try {
+            analysis = parseClaudeJson(claude.content?.[0]?.text);
+        } catch (e) {
+            console.error('analyzeBranchStandards: kein JSON', e.message, String(claude.content?.[0]?.text || '').slice(0, 300));
+            return res.status(502).json({ error: 'KI-Analyse nicht lesbar' });
+        }
 
         res.json(analysis);
     } catch (e) { res.status(500).json({ error: e.message }); }
@@ -6994,7 +7003,7 @@ Erstelle einen KONKRETEN Vorschlag als JSON:
         const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'x-api-key': claudeApiKey.value(), 'anthropic-version': '2023-06-01' },
-            body: JSON.stringify({ model: SONNET_MODEL, max_tokens: 1000, messages })
+            body: JSON.stringify({ model: SONNET_MODEL, max_tokens: 2500, messages })
         });
         // Siehe analyzeBranchStandards: Anthropic-Fehler nicht als leeres Objekt tarnen.
         if (!claudeRes.ok) {
@@ -7003,9 +7012,18 @@ Erstelle einen KONKRETEN Vorschlag als JSON:
             return res.status(502).json({ error: 'KI-Vorschlag nicht verfügbar', status: claudeRes.status });
         }
         const claude = await claudeRes.json();
-        const responseText = claude.content?.[0]?.text || '{}';
-        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-        const mockup = jsonMatch ? JSON.parse(jsonMatch[0]) : { error: 'Kein JSON' };
+        // Siehe analyzeBranchStandards: Kappung und Nicht-JSON nicht als 500 tarnen.
+        if (claude.stop_reason === 'max_tokens') {
+            console.error('generateMockupSuggestion: Antwort am Token-Deckel abgeschnitten', claude.usage);
+            return res.status(502).json({ error: 'KI-Vorschlag unvollständig (Antwort abgeschnitten)' });
+        }
+        let mockup;
+        try {
+            mockup = parseClaudeJson(claude.content?.[0]?.text);
+        } catch (e) {
+            console.error('generateMockupSuggestion: kein JSON', e.message, String(claude.content?.[0]?.text || '').slice(0, 300));
+            return res.status(502).json({ error: 'KI-Vorschlag nicht lesbar' });
+        }
 
         res.json(mockup);
     } catch (e) { res.status(500).json({ error: e.message }); }
